@@ -205,6 +205,7 @@ function startHand(room) {
     p.bet = 0;
     p.totalBet = 0;
     p.handName = null;
+    p.actedThisStreet = false;
   });
   room.players.filter(p => p.eliminated).forEach(p => { p.hand = []; p.bet = 0; p.folded = true; });
 
@@ -214,11 +215,18 @@ function startHand(room) {
   do { d = (d + 1) % n; } while (room.players[d].eliminated);
   room.dealer = d;
 
-  // Blinds
+  // Blinds — heads-up: dealer = SB, other = BB. 3+ players: dealer+1 = SB, dealer+2 = BB
   const active = activePlayers.filter(p => !p.eliminated);
   const dealerPos = active.indexOf(room.players[room.dealer]);
-  const sbPlayer = active[(dealerPos + 1) % active.length];
-  const bbPlayer = active[(dealerPos + 2) % active.length];
+  let sbPlayer, bbPlayer;
+  if (active.length === 2) {
+    // Heads-up: dealer posts SB, other posts BB
+    sbPlayer = active[dealerPos];
+    bbPlayer = active[(dealerPos + 1) % 2];
+  } else {
+    sbPlayer = active[(dealerPos + 1) % active.length];
+    bbPlayer = active[(dealerPos + 2) % active.length];
+  }
 
   postBlind(room, sbPlayer, room.smallBlind, 'small blind');
   postBlind(room, bbPlayer, room.bigBlind, 'big blind');
@@ -240,6 +248,7 @@ function postBlind(room, player, amount, label) {
   player.totalBet = actual;
   room.pot += actual;
   if (player.chips === 0) player.allIn = true;
+  // Blinds count as forced bets, NOT as voluntary actions — actedThisStreet stays false
   addLog(room, `  ${player.name} posta ${label}: ${actual}`);
 }
 
@@ -262,19 +271,51 @@ function setNextTurn(room, afterIdx) {
 }
 
 function allActed(room) {
-  // Street is over when all active non-folded non-allIn players have matched currentBet
   const active = room.players.filter(p => !p.folded && !p.eliminated);
   const canAct = active.filter(p => !p.allIn);
   if (canAct.length === 0) return true;
-  return canAct.every(p => p.bet === room.currentBet);
+  const betsMatch = canAct.every(p => p.bet === room.currentBet);
+  const allHadTurn = canAct.every(p => p.actedThisStreet);
+  return betsMatch && allHadTurn;
+}
+
+// ─── SIDE POTS ────────────────────────────────────────────────────────────────
+function calcSidePots(room) {
+  // Build side pots from totalBet amounts
+  const active = room.players.filter(p => !p.folded && !p.eliminated && p.totalBet > 0);
+  const allIn = active.filter(p => p.allIn).sort((a,b) => a.totalBet - b.totalBet);
+  if (allIn.length === 0) return null; // no side pots needed
+
+  const pots = [];
+  let covered = 0;
+  for (const allinP of allIn) {
+    const level = allinP.totalBet;
+    if (level <= covered) continue;
+    const contribution = level - covered;
+    const eligible = room.players.filter(p => !p.eliminated && !p.folded && p.totalBet >= level);
+    // Amount = contribution from ALL players who put in at least this level (including folded — they already contributed)
+    const contributors = room.players.filter(p => !p.eliminated && p.totalBet >= level);
+    const amount = contribution * contributors.length;
+    pots.push({ amount, eligible: eligible.map(p => p.id) });
+    covered = level;
+  }
+
+  // Main pot for remaining players above last all-in level
+  const remaining = room.players.filter(p => !p.eliminated && !p.folded && p.totalBet > covered);
+  if (remaining.length > 0) {
+    const extra = room.players.reduce((sum, p) => sum + Math.max(0, (p.totalBet||0) - covered), 0);
+    if (extra > 0) pots.push({ amount: extra, eligible: remaining.map(p => p.id) });
+  }
+
+  return pots.length > 0 ? pots : null;
 }
 
 function advanceStreet(room) {
   const active = room.players.filter(p => !p.folded && !p.eliminated);
   if (active.length === 1) { endHand(room); return; }
 
-  // Reset bets for new street
-  room.players.forEach(p => { p.bet = 0; });
+  // Reset bets and actions for new street
+  room.players.forEach(p => { p.bet = 0; p.actedThisStreet = false; });
   room.currentBet = 0;
   room.minRaise = room.bigBlind;
 
@@ -296,8 +337,7 @@ function advanceStreet(room) {
 
   // First to act post-flop: first active after dealer
   const n = room.players.length;
-  let start = room.dealer;
-  let idx = (start + 1) % n;
+  let idx = (room.dealer + 1) % n;
   let checked = 0;
   while (checked < n) {
     const p = room.players[idx];
@@ -305,6 +345,7 @@ function advanceStreet(room) {
     idx = (idx + 1) % n;
     checked++;
   }
+  // All remaining players are all-in — run out the board
   room.currentTurn = -1;
   advanceStreet(room);
 }
@@ -317,25 +358,51 @@ function endHand(room) {
 
   // Evaluate hands
   active.forEach(p => {
-    const best = getBestHand([...p.hand, ...room.community]);
-    p.bestScore = best.score;
-    p.handName = HAND_NAMES[best.score[0]];
+    const allCards = [...p.hand, ...room.community];
+    if (allCards.length >= 5) {
+      const best = getBestHand(allCards);
+      p.bestScore = best.score;
+      p.handName = HAND_NAMES[best.score[0]];
+    } else {
+      // Not enough community cards (e.g. everyone folded early)
+      p.bestScore = [0];
+      p.handName = 'Carta alta';
+    }
   });
 
-  // Find winner(s) — simple pot, no side pots for now
-  let bestScore = null;
-  active.forEach(p => {
-    if (!bestScore || compareScore(p.bestScore, bestScore) > 0) bestScore = p.bestScore;
-  });
-  const winners = active.filter(p => compareScore(p.bestScore, bestScore) === 0);
-  const share = Math.floor(room.pot / winners.length);
+  // ── SIDE POTS ──
+  const sidePots = calcSidePots(room);
+  const winnersAll = [];
 
-  winners.forEach(p => {
-    p.chips += share;
-    addLog(room, `🏆 ${p.name} gana ${share} fichas con ${p.handName}!`);
-  });
+  if (sidePots && sidePots.length > 0) {
+    addLog(room, `💰 Calculando botes separados (${sidePots.length})...`);
+    sidePots.forEach((pot, i) => {
+      const eligible = active.filter(p => pot.eligible.includes(p.id));
+      if (eligible.length === 0) return;
+      let bestScore = null;
+      eligible.forEach(p => { if (!bestScore || compareScore(p.bestScore, bestScore) > 0) bestScore = p.bestScore; });
+      const winners = eligible.filter(p => compareScore(p.bestScore, bestScore) === 0);
+      const share = Math.floor(pot.amount / winners.length);
+      winners.forEach(p => {
+        p.chips += share;
+        addLog(room, `🏆 ${p.name} gana bote${sidePots.length>1?' '+(i+1):''}: ${share} fichas con ${p.handName}`);
+        if (!winnersAll.find(w => w.name === p.name)) winnersAll.push({ name: p.name, handName: p.handName, chips: p.chips });
+      });
+    });
+  } else {
+    // Simple single pot
+    let bestScore = null;
+    active.forEach(p => { if (!bestScore || compareScore(p.bestScore, bestScore) > 0) bestScore = p.bestScore; });
+    const winners = active.filter(p => compareScore(p.bestScore, bestScore) === 0);
+    const share = Math.floor(room.pot / winners.length);
+    winners.forEach(p => {
+      p.chips += share;
+      addLog(room, `🏆 ${p.name} gana ${share} fichas con ${p.handName}!`);
+      winnersAll.push({ name: p.name, handName: p.handName, chips: p.chips });
+    });
+  }
 
-  room.winners = winners.map(p => ({ name: p.name, handName: p.handName, chips: p.chips }));
+  room.winners = winnersAll;
 
   // Eliminate broke players
   room.players.forEach(p => { if (p.chips <= 0 && !p.eliminated) { p.eliminated = true; addLog(room, `💀 ${p.name} eliminado`); } });
@@ -348,13 +415,14 @@ function endHand(room) {
 
 function handleAction(room, playerIdx, action, amount) {
   const player = room.players[playerIdx];
-  const n = room.players.length;
+
+  player.actedThisStreet = true;
 
   if (action === 'fold') {
     player.folded = true;
     addLog(room, `${player.name} se retira`);
     const active = room.players.filter(p => !p.folded && !p.eliminated);
-    if (active.length === 1) { room.pot; endHand(room); return; }
+    if (active.length === 1) { endHand(room); return; }
 
   } else if (action === 'check') {
     addLog(room, `${player.name} pasa`);
@@ -380,6 +448,8 @@ function handleAction(room, playerIdx, action, amount) {
     if (player.chips === 0) player.allIn = true;
     room.lastRaiseIdx = playerIdx;
     addLog(room, `${player.name} sube a ${raiseTotal}`);
+    // Bug 2 fix: when someone raises, reset actedThisStreet for all OTHER active players
+    room.players.forEach((p, i) => { if (i !== playerIdx && !p.folded && !p.eliminated && !p.allIn) p.actedThisStreet = false; });
 
   } else if (action === 'allin') {
     const toAdd = player.chips;
@@ -390,6 +460,8 @@ function handleAction(room, playerIdx, action, amount) {
       room.minRaise = player.bet - room.currentBet;
       room.currentBet = player.bet;
       room.lastRaiseIdx = playerIdx;
+      // Reset others so they can respond to the all-in raise
+      room.players.forEach((p, i) => { if (i !== playerIdx && !p.folded && !p.eliminated && !p.allIn) p.actedThisStreet = false; });
     }
     player.chips = 0;
     player.allIn = true;
